@@ -1,0 +1,8 @@
+numpy>=1.25
+scipy>=1.10
+cvxpy>=1.4
+osqp>=0.6
+matplotlib>=3.7
+jupyter>=1.0
+pytest>=8.0
+pillow>=10.0
