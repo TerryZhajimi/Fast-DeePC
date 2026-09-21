@@ -2,6 +2,7 @@ param(
     [string]$Compiler = "gcc"
 )
 
+<<<<<<< HEAD
 $compilerCommand = Get-Command $Compiler -ErrorAction SilentlyContinue
 if (-not $compilerCommand) {
     $msysCompiler = "C:\msys64\ucrt64\bin\gcc.exe"
@@ -16,6 +17,8 @@ else {
     $Compiler = $compilerCommand.Source
 }
 
+=======
+>>>>>>> 8876e67a3fd61ba491e59906f09bc3a096ac1399
 $root = Split-Path -Parent $PSScriptRoot
 $src = Join-Path $root "src"
 $out = Join-Path $root "build"
