@@ -140,15 +140,8 @@ static double fraction_to_boundary(const double *gamma, const double *theta,
     return alpha;
 }
 
-/*
- * The reduced (condensed) KKT system after eliminating gamma, theta, phi, psi
- * is the dense linear system
- *
- *     (H + diag(gamma./phi + theta./psi)) dz = r2_over_psi - r1_over_phi
- *
- * where r1_over_phi and r2_over_psi already carry the appropriate RHS for the
- * predictor (-gamma, -theta) or corrector (centering + 2nd-order term).
- */
+/* The reduced KKT system after eliminating gamma, theta, phi, psi is the dense linear system:(H + diag(gamma./phi + theta./psi)) dz = r2_over_psi - r1_over_phi
+ where r1_over_phi and r2_over_psi already carry the appropriate RHS for the predictor (-gamma, -theta) or corrector (centering + 2nd-order term)*/
 static int factor_dense_system(const double *H,
                                const double *gamma, const double *theta,
                                const double *phi,   const double *psi,
@@ -203,19 +196,15 @@ static int solve_factored_direction(const double *Hbar,
     return 0;
 }
 
-/*
- * dense_boxqp_solve
- * -----------------
- * H        : n x n dense SPD-ish reduced Hessian (column-major)
- * h        : n linear term
- * epsilon  : duality-gap tolerance 
- * max_iter : iteration cap 
- * z_warm   : optional warm start (NULL for cold start at 0); clipped into (-1,1)
- * z        : output, length n
- * info_out : optional diagnostics (NULL allowed)
- *
- * Returns: status (0 converged, 1 max-iter, -1 Cholesky failure, -2 alloc).
- */
+/* dense_boxqp_solve(Algorithm 1):
+ H        : n x n dense SPD-ish reduced Hessian (column-major)
+ h        : n linear term
+ epsilon  : duality-gap tolerance 
+ max_iter : iteration cap 
+ z_warm   : optional warm start (NULL for cold start at 0); clipped into (-1,1)
+ z        : output, length n
+ info_out : optional diagnostics (NULL allowed)
+ Returns: status (0 converged, 1 max-iter, -1 Cholesky failure, -2 alloc).*/
 static int dense_boxqp_solve_workspace(const double *H, const double *h,
                                        BINT n, double epsilon, BINT max_iter,
                                        const double *z_warm, double *z,
@@ -338,27 +327,203 @@ int dense_boxqp_solve(const double *H, const double *h,
                                        &g_boxqp_workspace);
 }
 
-/* DeePC OFFLINE / ONLINE ASSEMBLY                           */
+/* Generic Woodbury/K-form reduction offline */
+typedef struct {
+    BINT nfixed, nz, ncol, nrows;
+    double ridge;
+    double *A;              /* [A_fixed; A_decision], nrows x ncol */
+    double *Gchol;          /* chol(A A' / ridge + diag(1 / weights)) */
+    double *Hphys;          /* physical-variable reduced Hessian */
+    double *Fphys;          /* fixed_data -> physical linear term */
+    double *Hbox;           /* unit-box Hessian */
+    double *Fbox;           /* fixed_data -> unit-box linear term */
+    double *center, *scale, *hcenter, *hbox;
+    double *swarm, *sout;
+} DeePCKForm;
 
+void deepc_kform_free(DeePCKForm *d)
+{
+    if (!d) return;
+    free(d->A); free(d->Gchol); free(d->Hphys); free(d->Fphys);
+    free(d->Hbox); free(d->Fbox); free(d->center); free(d->scale);
+    free(d->hcenter); free(d->hbox); free(d->swarm); free(d->sout);
+    memset(d, 0, sizeof(*d));
+}
 
-/*
- * Dimensions used throughout:
- *   m      : number of inputs
- *   p      : number of outputs
- *   Tini   : length of the initial (past) window
- *   N      : prediction horizon
- *   L      = Tini + N           (Hankel column height multiplier)
- *   Tdata  : length of the offline data sequences ud, yd
- *   ncol   = Tdata - L + 1      (number of Hankel columns)
- *
- *   Up : (m*Tini) x ncol      Uf : (m*N) x ncol
- *   Yp : (p*Tini) x ncol      Yf : (p*N) x ncol
- *   Z  = [Up; Yp; Uf]         : (m*Tini + p*Tini + m*N) x ncol
- *   M  : ncol x ncol          (elimination matrix, Cholesky-factored)
- *
- *   nz = m*N + p*N            (reduced BoxQP dimension, z = col(u,y))
- *   Hhat : nz x nz dense reduced Hessian
- */
+/*Eliminate g with the Woodbury identity.  */
+int deepc_kform_offline(DeePCKForm *d,
+                        const double *A_fixed, const double *A_decision,
+                        BINT nfixed, BINT nz, BINT ncol,
+                        const double *fixed_weights,
+                        const double *decision_weights,
+                        double ridge, const double *decision_cost,
+                        const double *lower, const double *upper)
+{
+    BINT i, j, info = 0, nrhs;
+    BINT nrows = nfixed + nz;
+    double inv_ridge;
+    double *solve_z = NULL;
+
+    if (!d || !A_fixed || !A_decision || !fixed_weights ||
+        !decision_weights || !decision_cost || !lower || !upper ||
+        nfixed <= 0 || nz <= 0 || ncol <= 0 || ridge <= 0.0) return -10;
+
+    memset(d, 0, sizeof(*d));
+    d->nfixed = nfixed; d->nz = nz; d->ncol = ncol; d->nrows = nrows;
+    d->ridge = ridge;
+    d->A       = calloc((size_t)nrows*ncol, sizeof(double));
+    d->Gchol   = calloc((size_t)nrows*nrows, sizeof(double));
+    d->Hphys   = calloc((size_t)nz*nz, sizeof(double));
+    d->Fphys   = calloc((size_t)nz*nfixed, sizeof(double));
+    d->Hbox    = calloc((size_t)nz*nz, sizeof(double));
+    d->Fbox    = calloc((size_t)nz*nfixed, sizeof(double));
+    d->center  = calloc((size_t)nz, sizeof(double));
+    d->scale   = calloc((size_t)nz, sizeof(double));
+    d->hcenter = calloc((size_t)nz, sizeof(double));
+    d->hbox    = calloc((size_t)nz, sizeof(double));
+    d->swarm   = calloc((size_t)nz, sizeof(double));
+    d->sout    = calloc((size_t)nz, sizeof(double));
+    solve_z    = calloc((size_t)nrows*nz, sizeof(double));
+    if (!d->A || !d->Gchol || !d->Hphys || !d->Fphys || !d->Hbox ||
+        !d->Fbox || !d->center || !d->scale || !d->hcenter || !d->hbox ||
+        !d->swarm || !d->sout || !solve_z) { info = -1; goto done; }
+
+    for (j = 0; j < ncol; ++j) {
+        for (i = 0; i < nfixed; ++i)
+            d->A[i + j*nrows] = A_fixed[i + j*nfixed];
+        for (i = 0; i < nz; ++i)
+            d->A[nfixed + i + j*nrows] = A_decision[i + j*nz];
+    }
+
+    inv_ridge = 1.0 / ridge;
+    dgemm_("n", "t", &nrows, &nrows, &ncol, &inv_ridge,
+           d->A, &nrows, d->A, &nrows, &DZERO, d->Gchol, &nrows);
+    for (i = 0; i < nfixed; ++i) {
+        if (fixed_weights[i] <= 0.0) { info = -11; goto done; }
+        d->Gchol[i + i*nrows] += 1.0 / fixed_weights[i];
+    }
+    for (i = 0; i < nz; ++i) {
+        if (decision_weights[i] <= 0.0 || upper[i] <= lower[i]) {
+            info = -12; goto done;
+        }
+        d->Gchol[(nfixed+i) + (nfixed+i)*nrows] += 1.0 / decision_weights[i];
+    }
+    dpotrf_("l", &nrows, d->Gchol, &nrows, &info);
+    if (info != 0) { info = -2; goto done; }
+
+    /* solve_z = K[:, decision rows], K=(A A'/ridge+W^{-1})^{-1}. */
+    for (j = 0; j < nz; ++j) solve_z[(nfixed+j) + j*nrows] = 1.0;
+    nrhs = nz;
+    dpotrs_("l", &nrows, &nrhs, d->Gchol, &nrows,
+            solve_z, &nrows, &info);
+    if (info != 0) { info = -3; goto done; }
+
+    for (j = 0; j < nfixed; ++j)
+        for (i = 0; i < nz; ++i)
+            d->Fphys[i + j*nz] = solve_z[j + i*nrows];
+    for (j = 0; j < nz; ++j)
+        for (i = 0; i < nz; ++i)
+            d->Hphys[i + j*nz] = decision_cost[i + j*nz]
+                                   + solve_z[(nfixed+i) + j*nrows];
+
+    for (i = 0; i < nz; ++i) {
+        d->center[i] = 0.5 * (lower[i] + upper[i]);
+        d->scale[i] = 0.5 * (upper[i] - lower[i]);
+    }
+    for (j = 0; j < nz; ++j)
+        for (i = 0; i < nz; ++i)
+            d->Hbox[i + j*nz] = d->scale[i] * d->Hphys[i + j*nz] * d->scale[j];
+    for (j = 0; j < nfixed; ++j)
+        for (i = 0; i < nz; ++i)
+            d->Fbox[i + j*nz] = d->scale[i] * d->Fphys[i + j*nz];
+    for (i = 0; i < nz; ++i) {
+        double value = 0.0;
+        for (j = 0; j < nz; ++j) value += d->Hphys[i + j*nz] * d->center[j];
+        d->hcenter[i] = d->scale[i] * value;
+    }
+
+    info = 0;
+done:
+    free(solve_z);
+    if (info != 0) deepc_kform_free(d);
+    return (int)info;
+}
+
+/* Fixed-size online map and unit-box solve; z_warm/z_out use physical units. */
+int deepc_kform_online_step(DeePCKForm *d,
+                            const double *fixed_data,
+                            const double *tracking_linear,
+                            const double *z_warm,
+                            double epsilon, BINT max_iter,
+                            double *z_out, BoxQPInfo *info_out)
+{
+    BINT i;
+    int status;
+    if (!d || !fixed_data || !tracking_linear || !z_out) return -10;
+    dcopy_(&d->nz, d->hcenter, &IONE, d->hbox, &IONE);
+    dgemv_("n", &d->nz, &d->nfixed, &DONE, d->Fbox, &d->nz,
+           fixed_data, &IONE, &DONE, d->hbox, &IONE);
+    for (i = 0; i < d->nz; ++i)
+        d->hbox[i] += d->scale[i] * tracking_linear[i];
+    if (z_warm) {
+        for (i = 0; i < d->nz; ++i)
+            d->swarm[i] = clip_box_interior((z_warm[i] - d->center[i]) / d->scale[i]);
+    }
+    status = dense_boxqp_solve(d->Hbox, d->hbox, d->nz, epsilon, max_iter,
+                               z_warm ? d->swarm : NULL, d->sout, info_out);
+    for (i = 0; i < d->nz; ++i)
+        z_out[i] = d->center[i] + d->scale[i] * d->sout[i];
+    return status;
+}
+
+/* Recover the eliminated coordinate only for diagnostics and full-objective evaluation.*/
+int deepc_kform_recover_g(DeePCKForm *d,
+                          const double *fixed_data,
+                          const double *z,
+                          double *g_out)
+{
+    BINT i, info = 0, nrhs = 1;
+    double alpha;
+    double *rhs;
+
+    if (!d || !fixed_data || !z || !g_out || !d->A || !d->Gchol ||
+        d->ridge <= 0.0) return -10;
+
+    rhs = calloc((size_t)d->nrows, sizeof(double));
+    if (!rhs) return -1;
+
+    for (i = 0; i < d->nfixed; ++i) rhs[i] = fixed_data[i];
+    for (i = 0; i < d->nz; ++i) rhs[d->nfixed + i] = z[i];
+
+    dpotrs_("l", &d->nrows, &nrhs, d->Gchol, &d->nrows,
+            rhs, &d->nrows, &info);
+    if (info != 0) {
+        free(rhs);
+        return -2;
+    }
+
+    alpha = 1.0 / d->ridge;
+    dgemv_("t", &d->nrows, &d->ncol, &alpha,
+           d->A, &d->nrows, rhs, &IONE, &DZERO, g_out, &IONE);
+
+    free(rhs);
+    return 0;
+}
+
+/* DeePC OFFLINE / ONLINE ASSEMBLY   
+ m      : number of inputs
+ p      : number of outputs
+ Tini   : length of the initial (past) window
+ N      : prediction horizon
+ L      = Tini + N           (Hankel column height multiplier)
+ Tdata  : length of the offline data sequences ud, yd
+ ncol   = Tdata - L + 1      (number of Hankel columns)
+ Up : (m*Tini) x ncol      Uf : (m*N) x ncol
+ Yp : (p*Tini) x ncol      Yf : (p*N) x ncol
+ Z  = [Up; Yp; Uf]         : (m*Tini + p*Tini + m*N) x ncol
+ M  : ncol x ncol          (elimination matrix, Cholesky-factored)
+ nz = m*N + p*N            (reduced BoxQP dimension, z = col(u,y))
+ Hhat : nz x nz dense reduced Hessian*/
 
 typedef struct {
     BINT m, p, Tini, N, L, ncol, nz, nu, ny;
@@ -382,9 +547,7 @@ typedef struct {
 
 /* Build a block-Hankel matrix of column-height 'block_rows = dim*L' from a signal s of length Tdata with 'dim' channels (column-major signal: s[k*dim + c]
    is channel c at time k).  Output Hank is (dim*L) x ncol, column-major.
-
-   Hankel column j, row-block r (r = 0..L-1), channel c:Hank[(r*dim + c) + j*(dim*L)] = s[(j + r)*dim + c]
-*/
+   Hankel column j, row-block r (r = 0..L-1), channel c:Hank[(r*dim + c) + j*(dim*L)] = s[(j + r)*dim + c]*/
 static void build_hankel(const double *s, BINT dim, BINT Tdata, BINT L,
                          BINT ncol, double *Hank)
 {
@@ -396,24 +559,7 @@ static void build_hankel(const double *s, BINT dim, BINT Tdata, BINT L,
                 Hank[(r*dim + c) + j*block_rows] = s[(j + r)*dim + c];
 }
 
-/*
- * deepc_offline
- * -------------
- * Implements the OFFLINE phase:
- *   - build Hankel blocks Up/Uf, Yp/Yf
- *   - form Z = [Up; Yp; Uf]
- *   - form M = lambda Z'Z + rho Yf'Yf + lambda_g I
- *   - Cholesky-factor M
- *   - form reduced Hessian blocks Huu, Hyy, Huy via M^{-1}
- *   - assemble Hhat = [Huu Huy; Huy' Hyy]
- *
- * ud, yd : offline data, column-major, length Tdata each channel-block:
- *          ud[k*m + c], yd[k*p + c].
- * Wu, Wy : stage-cost weights already expanded to (m*N)x(m*N) and (p*N)x(p*N).
- *          Pass identity-scaled or block-diagonal as appropriate.
- *
- * Returns 0 on success, negative on failure.
- */
+/*This API is an older version of offline construction and it is not used in the current implementation.*/
 int deepc_offline(DeePC *d,
                   const double *ud, const double *yd, BINT Tdata,
                   BINT m, BINT p, BINT Tini, BINT N,
@@ -591,17 +737,7 @@ done:
     return (int)info;
 }
 
-/*
- * Shift the previous optimizer forward by one MPC step:
- *   [u0,u1,...,uN-1,y0,y1,...,yN-1]
- * becomes
- *   [u1,...,uN-1,uN-1,y1,...,yN-1,yN-1].
- *
- * This is available for callers that want a receding-horizon shifted warm
- * start.  deepc_online_step itself preserves the old behavior and uses the
- * supplied z_warm directly, because some slow-changing references warm-start
- * better from the unshifted previous optimizer.
- */
+/* Shift the previous optimizer forward by one MPC step, so [u0,u1,...,uN-1,y0,y1,...,yN-1]becomes [u1,...,uN-1,uN-1,y1,...,yN-1,yN-1]. */
 void deepc_shift_warm_start(const DeePC *d, const double *z_prev, double *z_shift)
 {
     BINT k, c;
@@ -617,26 +753,18 @@ void deepc_shift_warm_start(const DeePC *d, const double *z_prev, double *z_shif
     }
 }
 
-/*
- * deepc_online_step
- * -----------------
- * One online MPC step.  Implements:
- *   wpast = [uini; yini]
- *   hu    = Su wpast
- *   hy    = -Wy rt + Sy wpast
- *   hhat = [hu; hy]
- *   solve reduced BoxQP  min 0.5 z'Hhat z + hhat' z  s.t. -1<=z<=1
- *
- * uini : length m*Tini   (most recent Tini inputs, stacked col-major)
- * yini : length p*Tini   (most recent Tini outputs)
- * rt   : length p*N      (output reference over the horizon)
- * z_warm : optional warm start (length nz) or NULL
- * z_out  : output, length nz = m*N + p*N, = col(u_opt, y_opt)
- *
- * The first optimal input u0 is z_out[0 .. m-1].
- *
- * Returns BoxQP status (0 converged, 1 max-iter, -1 chol fail, -2 alloc).
- */
+/*deepc_online_step that solve reduced BoxQP  min 0.5 z'Hhat z + hhat' z  s.t. -1<=z<=1
+ wpast = [uini; yini]
+ hu    = Su wpast
+ hy    = -Wy rt + Sy wpast
+ hhat = [hu; hy]
+
+ uini : length m*Tini   (most recent Tini inputs, stacked col-major)
+ yini : length p*Tini   (most recent Tini outputs)
+ rt   : length p*N      (output reference over the horizon)
+ z_warm : optional warm start (length nz) or NULL
+ z_out  : output, length nz = m*N + p*N, = col(u_opt, y_opt)
+ The first optimal input u0 is z_out[0 .. m-1, and returns BoxQP status (0 converged, 1 max-iter, -1 chol fail, -2 alloc).*/
 int deepc_online_step(DeePC *d,
                       const double *uini, const double *yini, const double *rt,
                       const double *z_warm,
